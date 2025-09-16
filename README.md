@@ -46,3 +46,22 @@
  4) Demo: Run notebook/script, inspect suggested rules, and discuss next steps.
  5) Next: Connect lineage, orchestrate daily refresh, add human-in-the-loop review.
  
+ Databricks Model Serving Integration
+ - Purpose: Use your hosted LLM to enrich rules with business descriptions.
+ - Requirements:
+   - A Serving Endpoint that accepts chat-style payloads (JSON with `messages`).
+   - `DATABRICKS_HOST` and `DATABRICKS_TOKEN` env vars set, or pass flags.
+ - Create a PAT: User Settings → Developer → Access Tokens.
+ - Example run:
+   - `python ai_dq_recommender.py --demo --enable-llm \
+      --dbx-endpoint my-llm-endpoint \
+      --dbx-host https://<your-workspace-host> \
+      --dbx-token <PAT> \
+      --dq-rules-path dbfs:/tmp/delta/dq_rules`
+ - What the model receives:
+   - `system` prompt describing rule types and required JSON output.
+   - `user` JSON: table identity, column comments (business desc), compact profile summaries.
+ - What the model returns:
+   - JSON array: `{column, rule_type, rule_expression, rationale, confidence}`.
+   - Script validates and unions as `LLM_<rule_type>` with clipped confidence.
+

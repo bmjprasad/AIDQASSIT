@@ -40,11 +40,12 @@ import argparse
 import json
 import os
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+import requests
 
 
 # --------------- Spark / Delta setup ---------------
@@ -83,6 +84,9 @@ class DQConfig:
         percentile_range: Tuple[float, float] = (0.01, 0.99),
         profiles_history_path: str | None = None,
         enable_llm: bool = False,
+        dbx_endpoint: Optional[str] = None,
+        dbx_host: Optional[str] = None,
+        dbx_token: Optional[str] = None,
     ) -> None:
         self.input_type = input_type  # one of: table | path | view
         self.input_value = input_value
@@ -95,6 +99,9 @@ class DQConfig:
         self.percentile_range = percentile_range
         self.profiles_history_path = profiles_history_path
         self.enable_llm = enable_llm
+        self.dbx_endpoint = dbx_endpoint
+        self.dbx_host = dbx_host or os.environ.get("DATABRICKS_HOST")
+        self.dbx_token = dbx_token or os.environ.get("DATABRICKS_TOKEN")
 
 
 # --------------- Load + metadata utilities ---------------
@@ -492,26 +499,188 @@ def refine_confidence_with_history(
 
 # --------------- Optional LLM hook (stub) ---------------
 
-def llm_enrich_rules_stub(
-    rules_df: DataFrame, table_meta: Dict, enable_llm: bool
-) -> DataFrame:
-    """Placeholder for LLM-based enrichment using business descriptions.
+def _dbx_call_llm(
+    messages: List[Dict[str, str]],
+    endpoint: str,
+    host: str,
+    token: str,
+    temperature: float = 0.2,
+    max_tokens: int = 512,
+) -> Optional[str]:
+    """Call Databricks Model Serving chat endpoint using messages format.
 
-    In practice, call your model endpoint (e.g., Databricks Model Serving or OpenAI/Azure)
-    with column business descriptions to generate suggested rule rationales or add new rules.
-    This stub just echoes the input when disabled.
+    Expects response with either OpenAI-like choices[0].message.content or text.
+    Returns content string or None on failure.
     """
-    if not enable_llm:
+    url = host.rstrip("/") + f"/api/2.0/serving-endpoints/{endpoint}/invocations"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messages": messages,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        # Try OpenAI-like schema
+        if isinstance(data, dict):
+            choices = data.get("choices")
+            if choices and isinstance(choices, list):
+                msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+                if msg and isinstance(msg, dict):
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        return content
+            # Fallback to text or predictions
+            if "text" in data and isinstance(data["text"], str):
+                return data["text"]
+            if "predictions" in data and isinstance(data["predictions"], list) and data["predictions"]:
+                pred0 = data["predictions"][0]
+                if isinstance(pred0, str):
+                    return pred0
+                if isinstance(pred0, dict) and "text" in pred0:
+                    return pred0["text"]
+        return None
+    except Exception:
+        return None
+
+
+def llm_enrich_rules_databricks(
+    spark: SparkSession,
+    rules_df: DataFrame,
+    table_meta: Dict,
+    profiles_df: DataFrame,
+    endpoint: Optional[str],
+    host: Optional[str],
+    token: Optional[str],
+) -> DataFrame:
+    """Use Databricks Model Serving to propose additional business-informed rules.
+
+    The LLM returns a JSON list of suggestions with fields:
+      column, rule_type, rule_expression, rationale, confidence (0..1)
+    We'll validate, clip confidence, and union to the existing rules.
+    On any failure, original rules are returned.
+    """
+    if not endpoint or not host or not token:
         return rules_df
-    # Example of adding a small boost when descriptions exist
-    comments = table_meta.get("column_comments", {})
-    add_cols = rules_df.withColumn(
-        "confidence",
-        F.when(F.col("column").isin([*comments.keys()]), F.col("confidence") + F.lit(0.03)).otherwise(
-            F.col("confidence")
+
+    # Build a compact profile summary for prompt context
+    prof_rows = profiles_df.collect()
+    column_summaries = []
+    for r in prof_rows:
+        summary = {
+            "column": r["column_name"],
+            "data_type": r["data_type"],
+            "null_fraction": float(r.get("null_fraction") or 0.0),
+            "distinct_count": int(r.get("distinct_count") or 0),
+        }
+        if r["data_type"] == "string":
+            summary.update(
+                {
+                    "min_len": r.get("min_len"),
+                    "max_len": r.get("max_len"),
+                    "top_values_sample": (r.get("top_values_sample") or [])[:5],
+                }
+            )
+        column_summaries.append(summary)
+
+    system = {
+        "role": "system",
+        "content": (
+            "You are a data quality assistant. Propose simple, actionable rules (NOT_NULL, "
+            "UNIQUE, ENUM, RANGE, PATTERN) based on schema, business descriptions, and profiles. "
+            "Response MUST be compact JSON array only, no prose."
+        ),
+    }
+    user = {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "table": table_meta.get("table_identity"),
+                "descriptions": table_meta.get("column_comments", {}),
+                "profiles": column_summaries,
+                "output_schema": [
+                    "column",
+                    "rule_type",
+                    "rule_expression",
+                    "rationale",
+                    "confidence",
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+    content = _dbx_call_llm([system, user], endpoint, host, token)
+    if not content:
+        return rules_df
+
+    # Extract JSON from response
+    text = content.strip()
+    # If model returned fenced code, try to isolate JSON
+    if "```" in text:
+        parts = text.split("```")
+        # choose the largest JSON-looking part
+        candidates = [p for p in parts if p.strip().startswith("[")]
+        text = max(candidates, key=len) if candidates else text
+    try:
+        suggestions = json.loads(text)
+        if not isinstance(suggestions, list):
+            return rules_df
+    except Exception:
+        return rules_df
+
+    # Normalize and build DataFrame
+    norm: List[Dict] = []
+    for s in suggestions:
+        if not isinstance(s, dict):
+            continue
+        col = s.get("column")
+        rtype = s.get("rule_type")
+        rexpr = s.get("rule_expression")
+        rationale = s.get("rationale")
+        conf = s.get("confidence", 0.55)
+        if not col or not rtype:
+            continue
+        try:
+            conf = float(conf)
+        except Exception:
+            conf = 0.55
+        conf = max(0.0, min(1.0, conf))
+        norm.append(
+            {
+                "table": table_meta.get("table_identity"),
+                "column": col,
+                "rule_type": f"LLM_{rtype}",
+                "rule_expression": rexpr,
+                "parameters": None,
+                "rationale": rationale,
+                "confidence": conf,
+            }
+        )
+
+    if not norm:
+        return rules_df
+
+    add_df = spark.createDataFrame(
+        norm,
+        schema=T.StructType(
+            [
+                T.StructField("table", T.StringType(), False),
+                T.StructField("column", T.StringType(), True),
+                T.StructField("rule_type", T.StringType(), False),
+                T.StructField("rule_expression", T.StringType(), True),
+                T.StructField("parameters", T.MapType(T.StringType(), T.StringType()), True),
+                T.StructField("rationale", T.StringType(), True),
+                T.StructField("confidence", T.DoubleType(), True),
+            ]
         ),
     )
-    return add_cols
+    return rules_df.unionByName(add_df, allowMissingColumns=True)
 
 
 # --------------- Persist rules ---------------
@@ -572,7 +741,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enum-max-ratio", type=float, default=0.05)
     p.add_argument("--unique-tolerance", type=float, default=0.01)
     p.add_argument("--profiles-history-path", default=None, help="Optional Delta path of historical profiles")
-    p.add_argument("--enable-llm", action="store_true", help="Enable LLM enrichment (stub)")
+    p.add_argument("--enable-llm", action="store_true", help="Enable LLM enrichment via Databricks Model Serving")
+    p.add_argument("--dbx-endpoint", default=None, help="Databricks serving endpoint name (chat/completions style)")
+    p.add_argument("--dbx-host", default=None, help="Databricks workspace URL (or set DATABRICKS_HOST)")
+    p.add_argument("--dbx-token", default=None, help="Databricks PAT (or set DATABRICKS_TOKEN)")
     p.add_argument("--demo", action="store_true", help="Create demo data and temp view, then run")
     return p.parse_args()
 
@@ -591,6 +763,9 @@ def main() -> None:
         unique_tolerance=args.unique_tolerance,
         profiles_history_path=args.profiles_history_path,
         enable_llm=args.enable_llm,
+        dbx_endpoint=args.dbx_endpoint,
+        dbx_host=args.dbx_host,
+        dbx_token=args.dbx_token,
     )
 
     if args.demo:
@@ -613,7 +788,16 @@ def main() -> None:
 
     # Optional refinements
     rules_df = refine_confidence_with_history(spark, profiles_df, rules_df, cfg.profiles_history_path)
-    rules_df = llm_enrich_rules_stub(rules_df, table_meta, cfg.enable_llm)
+    if cfg.enable_llm:
+        rules_df = llm_enrich_rules_databricks(
+            spark,
+            rules_df,
+            table_meta,
+            profiles_df,
+            endpoint=cfg.dbx_endpoint,
+            host=cfg.dbx_host,
+            token=cfg.dbx_token,
+        )
 
     # Persist
     write_rules_to_delta(rules_df, cfg.dq_rules_path)
